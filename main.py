@@ -1,197 +1,223 @@
 #!/usr/bin/env python3
-"""Publish the one-line entry for the make.fun bounty
-"The 3AM Fridge Text".
+"""The 3AM Fridge Text — publish the fridge's one-line text.
 
-The text lives in ``entry.txt`` next to this file: the message a
-smart fridge sends its owner at 3am. This program reads that
-file as raw bytes, checks the decoded text against the bounty
-gate (UTF-8 text, one line, 1 to 140 characters, not only white
-space), and writes the exact same bytes to ``entry.txt`` in the
-output directory. Nothing is stripped, trimmed, or re-encoded:
-the published bytes are byte-identical to the source file,
-trailing newline included. After writing, the program reads the
-published file back and compares it byte for byte before
-reporting success, so a silent truncation or rewrite can never
-pass unnoticed.
+A smart fridge has been awake all night watching its owner come
+back for "just one bite" again and again. At 3:04 AM it finally
+texts the owner: the leftovers have filed a formal complaint, and
+the fridge is forwarding that complaint to the owner's future
+self. The line itself lives in ``entry.txt`` beside this script;
+this script never invents, edits, or re-types it.
 
-Characters are counted as Unicode code points, the same way the
-gate counts them; bytes are reported beside them so the two can
-never be confused. Standard library only, no network, no clock,
-no randomness, so two runs always produce identical output.
+What the script does, in order:
 
-The output directory is ``--output-dir`` when given, else
-``$MAKEFUN_OUTPUT_DIR`` when set, else ``/output``.
+1. Reads ``entry.txt`` as raw bytes, exactly as stored.
+2. Decodes those bytes as UTF-8 and measures the message the way
+   the bounty gate measures it: Unicode code points, not bytes,
+   one single line, between 1 and 140 characters, and more than
+   blank space.
+3. Copies the raw bytes — trailing newline and all — into
+   ``entry.txt`` inside the output directory, then reads the copy
+   back and refuses to report success unless every byte matches.
+   A byte-order mark at the start of the file is rejected outright:
+   it would decode to an invisible extra character and the
+   published bytes would no longer be the line the gate measured.
 
-Options:
-  --output-dir <dir>  write entry.txt into <dir> instead
-  --max-chars <n>     check against a limit other than 140
-  --verify-only       check the entry without writing anything
-  --quiet             print nothing on success (errors still show)
+The destination defaults to ``/output``. Pass ``--output-dir`` to
+choose another folder, or set ``MAKEFUN_OUTPUT_DIR``. Use
+``--verify-only`` to check the line without writing anything, and
+``--quiet`` to stay silent on success. Only the standard library
+is used; there is no network access, no clock, and no randomness,
+so repeated runs are identical.
 
-Exit codes: 0 success, 1 the entry fails the gate or the output
-cannot be written, 2 a command-line argument is unusable.
+Usage:
+    python3 main.py [--output-dir DIR] [--max-chars N]
+                    [--verify-only] [--quiet] [--show]
+
+Exit status is 0 on success, 1 when the entry fails the gate or
+the output cannot be written, and 2 when an argument is bad.
 """
 
 import argparse
 import os
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_MAX_CHARS = 140
+LIMIT = 140
+FALLBACK_DIR = "/output"
+SOURCE_NAME = "entry.txt"
 
 
-class EntryError(Exception):
-    """The entry file fails the bounty gate."""
+class GateFailure(Exception):
+    """Raised when the stored line does not satisfy the gate."""
 
 
-@dataclass(frozen=True)
-class EntryReport:
-    """What the gate check found in ``entry.txt``."""
-
-    sentence: str
-    byte_length: int
-    has_trailing_newline: bool
-
-    @property
-    def char_length(self) -> int:
-        return len(self.sentence)
-
-    @property
-    def word_count(self) -> int:
-        return len(self.sentence.split())
-
-    def summary(self) -> str:
-        newline = "with" if self.has_trailing_newline else "without"
-        return (
-            f"{self.char_length} characters, {self.word_count} words, "
-            f"{self.byte_length} bytes, {newline} trailing newline"
-        )
+def source_file():
+    """Path of the entry file shipped next to this script."""
+    return Path(__file__).resolve().parent / SOURCE_NAME
 
 
-def entry_path() -> Path:
-    return Path(__file__).resolve().parent / "entry.txt"
-
-
-def load_entry_bytes() -> bytes:
+def read_source():
+    """Return the entry file's raw bytes, or raise GateFailure."""
     try:
-        return entry_path().read_bytes()
-    except FileNotFoundError as exc:
-        raise EntryError("entry.txt not found next to main.py") from exc
-    except OSError as exc:
-        raise EntryError(f"cannot read entry.txt: {exc}") from exc
+        return source_file().read_bytes()
+    except FileNotFoundError:
+        raise GateFailure("entry.txt is missing next to main.py")
+    except OSError as problem:
+        raise GateFailure("entry.txt could not be read: %s" % problem)
 
 
-def inspect_entry(data: bytes, max_chars: int) -> EntryReport:
-    """Decode ``data`` and check it against the bounty gate."""
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise EntryError(f"entry.txt is not valid UTF-8: {exc}") from exc
-    has_newline = text.endswith("\n")
-    sentence = text[:-1] if has_newline else text
-    if not sentence or sentence.isspace():
-        raise EntryError("entry is empty or only white space")
-    if "\n" in sentence or "\r" in sentence:
-        raise EntryError("entry must be a single line")
-    if sentence != sentence.strip():
-        raise EntryError("entry has leading or trailing white space")
-    if any(ord(ch) < 32 for ch in sentence):
-        raise EntryError("entry contains a control character")
-    if len(sentence) > max_chars:
-        raise EntryError(
-            f"entry is {len(sentence)} characters, "
-            f"over the {max_chars} limit"
+def split_trailing_newline(text):
+    """Split off one trailing newline; return (body, had_newline)."""
+    if text.endswith("\n"):
+        return text[:-1], True
+    return text, False
+
+
+def check_line(text, limit):
+    """Validate the decoded line and return (body, had_newline).
+
+    The gate counts characters as Unicode code points. A line that
+    is empty, blank, split over several lines, padded with spaces,
+    holding a control character, or longer than ``limit`` fails.
+    """
+    body, had_newline = split_trailing_newline(text)
+    if body == "" or body.isspace():
+        raise GateFailure("entry is empty or only white space")
+    if "\n" in body or "\r" in body:
+        raise GateFailure("entry must be exactly one line")
+    if body.strip() != body:
+        raise GateFailure("entry has leading or trailing white space")
+    for char in body:
+        if ord(char) < 0x20:
+            raise GateFailure("entry contains a control character")
+    if len(body) > limit:
+        raise GateFailure(
+            "entry is %d characters, over the %d limit" % (len(body), limit)
         )
-    return EntryReport(
-        sentence=sentence,
-        byte_length=len(data),
-        has_trailing_newline=has_newline,
+    return body, had_newline
+
+
+def decode_and_check(raw, limit):
+    """Decode raw bytes as UTF-8 and run the gate over the result."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise GateFailure("entry.txt starts with a UTF-8 byte-order mark")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as problem:
+        raise GateFailure("entry.txt is not valid UTF-8: %s" % problem)
+    return check_line(text, limit)
+
+
+def describe(body, raw, had_newline):
+    """One human-readable line describing the validated entry."""
+    words = len(body.split())
+    tail = "with" if had_newline else "without"
+    return "%d characters, %d words, %d bytes, %s trailing newline" % (
+        len(body),
+        words,
+        len(raw),
+        tail,
     )
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="Validate and publish the 3AM Fridge Text entry.",
+    )
     parser.add_argument(
         "--output-dir",
+        metavar="DIR",
         default=None,
-        help="directory to write entry.txt into",
+        help="write entry.txt into DIR (default: $MAKEFUN_OUTPUT_DIR or /output)",
     )
     parser.add_argument(
         "--max-chars",
+        metavar="N",
         type=int,
-        default=DEFAULT_MAX_CHARS,
+        default=LIMIT,
         help="character limit to check against (default: 140)",
     )
     parser.add_argument(
         "--verify-only",
         action="store_true",
-        help="validate the entry without writing it",
+        help="only validate the entry; write nothing",
     )
     parser.add_argument(
         "--quiet",
         action="store_true",
         help="print nothing on success",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="also print the entry line itself on success",
+    )
+    return parser
 
 
-def resolve_output_dir(args) -> Path:
-    raw = args.output_dir or os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    out_dir = Path(raw)
-    if out_dir.exists() and not out_dir.is_dir():
-        raise EntryError(f"output path is not a directory: {out_dir}")
-    if out_dir.resolve() == Path(__file__).resolve().parent:
-        raise EntryError("output directory must not be the repository root")
-    return out_dir
+def pick_output_dir(args):
+    """Resolve the output directory from flag, env, then default."""
+    chosen = args.output_dir or os.environ.get("MAKEFUN_OUTPUT_DIR") or FALLBACK_DIR
+    folder = Path(chosen)
+    if folder.exists() and not folder.is_dir():
+        raise GateFailure("output path is not a directory: %s" % folder)
+    if folder.resolve() == Path(__file__).resolve().parent:
+        raise GateFailure("output directory must not be the repository root")
+    return folder
 
 
-def publish(data: bytes, out_dir: Path) -> Path:
-    """Write ``data`` verbatim and prove the copy matches."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "entry.txt"
-    out_path.write_bytes(data)
-    if out_path.read_bytes() != data:
-        raise EntryError("published entry does not match entry.txt")
-    return out_path
+def write_verbatim(raw, folder):
+    """Write raw bytes to folder/entry.txt and prove the copy matches."""
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / SOURCE_NAME
+    target.write_bytes(raw)
+    if target.read_bytes() != raw:
+        raise GateFailure("published entry does not match entry.txt")
+    return target
 
 
-def fail(message: str) -> int:
+def report_error(message):
     print(message, file=sys.stderr)
     return 1
 
 
-def main(argv=None) -> int:
-    args = parse_args(argv)
+def run(argv=None):
+    args = build_parser().parse_args(argv)
     if args.max_chars < 1:
         print("--max-chars must be at least 1", file=sys.stderr)
         return 2
     try:
-        data = load_entry_bytes()
-        report = inspect_entry(data, args.max_chars)
-    except EntryError as exc:
-        return fail(f"Invalid: {exc}")
-    if report.char_length > args.max_chars - 10:
+        raw = read_source()
+        body, had_newline = decode_and_check(raw, args.max_chars)
+    except GateFailure as problem:
+        return report_error("Invalid: %s" % problem)
+    summary = describe(body, raw, had_newline)
+    if len(body) > args.max_chars - 10:
         print(
-            f"Note: entry is {report.char_length} characters, "
-            f"within 10 of the {args.max_chars} limit",
+            "Note: entry is %d characters, within 10 of the %d limit"
+            % (len(body), args.max_chars),
             file=sys.stderr,
         )
     if args.verify_only:
         if not args.quiet:
-            print(f"Valid: {report.summary()}")
+            print("Valid: %s" % summary)
+        if args.show:
+            print(body)
         return 0
     try:
-        out_dir = resolve_output_dir(args)
-        out_path = publish(data, out_dir)
-    except EntryError as exc:
-        return fail(f"Invalid: {exc}")
-    except OSError as exc:
-        return fail(f"Cannot write output: {exc}")
+        folder = pick_output_dir(args)
+        target = write_verbatim(raw, folder)
+    except GateFailure as problem:
+        return report_error("Invalid: %s" % problem)
+    except OSError as problem:
+        return report_error("Cannot write output: %s" % problem)
     if not args.quiet:
-        print(f"Wrote {report.summary()} to {out_path}")
+        print("Wrote %s to %s" % (summary, target))
+    if args.show:
+        print(body)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())
